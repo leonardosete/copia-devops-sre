@@ -1,0 +1,158 @@
+name: 2-DEPLOY-APP
+on:
+  push: 
+    branches: [release-*, feature-*, hotfix-*]
+  workflow_dispatch:
+
+env: ## Variables available in this workflow
+  APPROVERS: "leonardosete" ## TROCAR POR SEU USUARIO GIT
+
+  PROJECT_ID: "projc-devops-sete"
+  CLUSTER_NAME: "leosete-cluster-prod"
+  REGION: "us-central1"
+  REPOSITORY: "sre-docker-registry"
+  IMAGE_NAME: "flask-app"
+  APP_K8S_NAME: "flask-app"
+jobs:
+  build_app:
+    outputs: 
+      output1: ${{ steps.increment-git-tag.outputs.git-tag }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1-CHECKOUT ACTIONS
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: 2-AUTHENTICATE TO GOOGLE CLOUD
+        id: auth
+        uses: google-github-actions/auth@v0
+        with:
+          credentials_json: ${{ secrets.GCP_TERRAFORM_SVC_ACCOUNT }}
+
+      - name: 3-SETUP CLOUD SDK
+        uses: google-github-actions/setup-gcloud@v0
+
+      - name: 4-GET CREDENTIALS
+        uses: 'google-github-actions/get-gke-credentials@v0'
+        with:
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.REGION }}
+
+      - name: 5-BUILD DOCKER IMAGE
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:latest .
+          gcloud auth configure-docker  ${{ env.REGION }}-docker.pkg.dev --quiet
+          
+      - name: 6-SEMANTIC VERSION
+        id: semantic-version
+        run: |
+          bash ./scripts/semantic-version.sh
+      
+      - name: 7-AUTOMATIC TAGGING OF RELEASES
+        id: increment-git-tag
+        run: |
+          bash ./scripts/git_update.sh -v ${{ steps.semantic-version.outputs.semantic-version }}
+
+      - name: 8-TESTING APPLICATION
+        run: |
+          docker run -t ${{ env.IMAGE_NAME }}:latest bash -c "BASE_API_ENV=test pipenv run pytest"
+
+      - name: 9-PUSH DOCKER IMAGE TO ARTIFACT REGISTRY
+        env:
+          GIT_TAG: ${{ steps.increment-git-tag.outputs.git-tag }}
+        run: |
+          gcloud auth configure-docker  ${{ env.REGION }}-docker.pkg.dev --quiet
+          docker tag ${{ env.IMAGE_NAME }}:latest  ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
+          docker tag ${{ env.IMAGE_NAME }}:latest  ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:$GIT_TAG
+          docker push  ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
+          docker push  ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:$GIT_TAG 
+
+  deploy_apps:
+    needs: build_app
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app_env: [dev, hlg, prd]
+        include:
+          - app_env: dev
+            env_deploy: DEVELOPMENT
+          - app_env: hlg
+            env_deploy: HOMOLOG
+          - app_env: prd
+            env_deploy: PRODUCTION
+      fail-fast: true ## se uma execução do job falhar, vai parar tudo
+      max-parallel: 1
+    env: ## Variables available in this job
+      NS_APP: "leosete-sre-apps-${{ matrix.app_env }}"
+      WORK_DIR: "./k8s"
+    defaults:
+      run:
+        working-directory: ${{ env.WORK_DIR }}
+
+    steps:
+      - name: 1-CHECKOUT ACTIONS
+        uses: actions/checkout@v3
+  
+      - name: 2-AUTHENTICATE TO GOOGLE CLOUD
+        id: auth
+        uses: google-github-actions/auth@v0
+        with:
+          credentials_json: ${{ secrets.GCP_TERRAFORM_SVC_ACCOUNT }}
+
+      - name: 3-SETUP CLOUD SDK
+        uses: google-github-actions/setup-gcloud@v0
+
+      - name: 4-GET GKE CREDENTIALS
+        uses: 'google-github-actions/get-gke-credentials@v0'
+        with:
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.REGION }}
+
+      - name: 5-CHECK NAMESPACE TO DEPLOY
+        id: check-ns
+        continue-on-error: true
+        run: |
+          kubectl get ns ${{ env.NS_APP }} > check-ns.txt
+          CHECK_NS=`cat check-ns.txt |grep ${{ env.NS_APP }} |awk '{print $1}'` >> $GITHUB_ENV
+          echo ::set-output name=ns_name::$CHECK_NS
+          echo "The current Namespace is ${{ env.NS_APP }}"
+        
+      - name: 6-CREATE K8s OBJECTS - FIRST RUN
+        if: ${{ steps.check-ns.outputs.ns_name != env.NS_APP }}
+        run: |
+          kubectl apply -f deploy-${{ matrix.app_env }}.yaml
+
+      - name: 7-APPROVE OR DENY DEPLOY
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.token }}
+          approvers: ${{ env.APPROVERS }}
+          issue-title: "Deploying App in ${{ matrix.env_deploy }}"
+          timeout-minutes: 60 ## Se não for aprovado em 1 hora, será cancelado.
+
+      - name: 8-APPLICATION APPROVED TO DEPLOY IN ${{ matrix.env_deploy }}
+        run: |
+          kubectl set image deployment.v1.apps/${{ env.APP_K8S_NAME }} ${{ env.APP_K8S_NAME }}=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ needs.build_app.outputs.output1 }} --namespace ${{ env.NS_APP }}
+
+  merge_master:
+    needs: deploy_apps
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1-CHECKOUT ACTIONS
+        uses: actions/checkout@v3
+
+      - name: 2-APPROVE OR DENY MERGE TO MASTER
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.token }}
+          approvers: ${{ env.APPROVERS }}
+          issue-title: "Approve merge ${{ github.ref_name }} branch into master branch"
+
+      - name: MERGE ${{ github.ref_name }} BRANCH INTO master BRANCH
+        uses: devmasx/merge-branch@master
+        with:
+          type: now
+          from_branch: ${{ github.ref_name }}
+          target_branch: master
+          github_token: ${{ github.token }}

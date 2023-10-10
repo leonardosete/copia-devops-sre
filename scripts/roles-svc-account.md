@@ -1,0 +1,13 @@
+artifactregistry.admin
+compute.admin
+container.admin
+container.clusterAdmin
+dns.admin
+iam.serviceAccountAdmin
+iam.serviceAccountUser
+logging.logWriter
+monitoring.metricWriter
+monitoring.viewer
+resourcemanager.projectIamAdmin
+stackdriver.resourceMetadata.writer
+storage.objectAdmin
